@@ -6,7 +6,7 @@ Tracks RSI(28) crossovers on 3m and 5m timeframes:
   - Signal 1 : RSI(28) × EMA(13) crossover
   - Signal 2 : RSI(28) × SMA(50) crossover
 
-Polls Binance exactly on candle close (with +2 s buffer).
+Polls Binance exactly on candle close (with +2 s buffer)
 Sends formatted Telegram alerts on every new crossover event.
 
 Warm-up analysis
