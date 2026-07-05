@@ -3,10 +3,20 @@
 SOLUSDT RSI Crossover Signal Bot
 =================================
 Tracks RSI(28) crossovers on 3m and 5m timeframes:
-  - Signal 1: RSI(28) × EMA(13) crossover
-  - Signal 2: RSI(28) × SMA(50) crossover
+  - Signal 1 : RSI(28) × EMA(13) crossover
+  - Signal 2 : RSI(28) × SMA(50) crossover
 
-Polls Binance on candle close and sends Telegram alerts.
+Polls Binance exactly on candle close (with +2 s buffer).
+Sends formatted Telegram alerts on every new crossover event.
+
+Warm-up analysis
+─────────────────
+  RSI(28)          → needs 28 bars before first valid value
+  EMA(13) of RSI   → needs 28+13 = 41 bars
+  SMA(50) of RSI   → needs 28+50 = 78 bars   ← tightest constraint
+  Crossover detect → needs 2 valid MA bars   → minimum 80 candles total
+
+  CANDLE_LIMIT = 300  →  300 − 80 = 220 fully stable signal bars ✅
 """
 
 import time
@@ -17,25 +27,37 @@ import numpy as np
 from datetime import datetime, timezone
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg---"
+TELEGRAM_TOKEN   = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg"
 TELEGRAM_CHAT_ID = "1950462171"
 
-SYMBOL     = "SOLUSDT"
+SYMBOL       = "SOLUSDT"
 BINANCE_BASE = "https://api.binance.com"
 
-# RSI & moving-average settings
+# Indicator periods
 RSI_PERIOD = 28
 EMA_PERIOD = 13
 SMA_PERIOD = 50
 
-# Candles to fetch (must be > SMA_PERIOD + RSI_PERIOD for warm-up)
-CANDLE_LIMIT = 200
+# Candles fetched per request.
+# Must satisfy: CANDLE_LIMIT > RSI_PERIOD + SMA_PERIOD + 2  (= 80 minimum)
+# We use 300 → 220 stable bars after warm-up, plenty of headroom.
+CANDLE_LIMIT = 300
 
-# Timeframes to monitor: (interval_string, poll_interval_seconds)
+# Minimum usable candles after warm-up (auto-derived, used as a guard)
+MIN_CANDLES_REQUIRED = RSI_PERIOD + SMA_PERIOD + 2   # = 80
+
+# Timeframes: (binance interval string, integer minutes)
 TIMEFRAMES = [
-    ("3m", 3 * 60),
-    ("5m", 5 * 60),
+    ("3m", 3),
+    ("5m", 5),
 ]
+
+# Seconds added after candle close before fetching (lets Binance finalise)
+CANDLE_CLOSE_BUFFER_SECS = 2
+
+# Retry settings for Binance fetch
+FETCH_RETRIES    = 3
+FETCH_RETRY_WAIT = 5   # seconds between retries
 
 # ─── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -48,51 +70,58 @@ log = logging.getLogger(__name__)
 
 # ─── TELEGRAM ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str) -> bool:
-    """Send a message via Telegram Bot API."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }
+    """Send a message via Telegram Bot API (HTML parse mode)."""
+    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code == 200:
-            log.info("Telegram ✅ sent: %s", message[:80])
+            log.info("Telegram ✅  %s", message[:80].replace("\n", " "))
             return True
-        else:
-            log.error("Telegram ❌ error %s: %s", resp.status_code, resp.text)
-            return False
-    except Exception as e:
-        log.error("Telegram exception: %s", e)
+        log.error("Telegram ❌ %s: %s", resp.status_code, resp.text[:120])
+        return False
+    except Exception as exc:
+        log.error("Telegram exception: %s", exc)
         return False
 
 
 # ─── BINANCE DATA ──────────────────────────────────────────────────────────────
 def fetch_klines(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
     """
-    Fetch OHLCV klines from Binance public REST API.
-    Returns DataFrame with columns: open_time, open, high, low, close, volume, close_time.
-    Only closed candles are included (last candle excluded as it may be live).
+    Fetch closed OHLCV klines from Binance public REST API.
+
+    Requests limit+1 candles and drops the last one because it is still
+    forming (live candle).  Retries up to FETCH_RETRIES times on failure.
+
+    Returns DataFrame columns:
+        open_time, close_time, open, high, low, close (float), volume
+    Returns empty DataFrame on unrecoverable error.
     """
-    url = f"{BINANCE_BASE}/api/v3/klines"
+    url    = f"{BINANCE_BASE}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit + 1}
 
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        raw = resp.json()
-    except requests.RequestException as e:
-        log.error("Binance fetch error: %s", e)
-        return pd.DataFrame()
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            raw  = resp.json()
+            break
+        except requests.RequestException as exc:
+            log.warning("Binance fetch attempt %d/%d failed: %s",
+                        attempt, FETCH_RETRIES, exc)
+            if attempt < FETCH_RETRIES:
+                time.sleep(FETCH_RETRY_WAIT)
+            else:
+                log.error("Binance fetch gave up after %d attempts.", FETCH_RETRIES)
+                return pd.DataFrame()
 
     df = pd.DataFrame(raw, columns=[
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
+        "taker_buy_base", "taker_buy_quote", "ignore",
     ])
 
-    # Keep only closed candles (drop the last live candle)
+    # Drop the still-forming live candle (last row)
     df = df.iloc[:-1].copy()
 
     df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
@@ -104,41 +133,47 @@ def fetch_klines(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.Da
 
 # ─── INDICATORS ────────────────────────────────────────────────────────────────
 def compute_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    """Wilder's smoothed RSI."""
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-
-    # Wilder smoothing (equivalent to EMA with alpha = 1/period)
+    """
+    Wilder's Smoothed RSI.
+    Uses EWM with alpha = 1/period (identical to TradingView's RSI).
+    First `period` values are NaN (insufficient history).
+    """
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-
-    rs  = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 
 def compute_ema(series: pd.Series, period: int) -> pd.Series:
-    """Exponential Moving Average."""
+    """Standard EMA (span = period).  NaN rows from input propagate."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def compute_sma(series: pd.Series, period: int) -> pd.Series:
-    """Simple Moving Average."""
-    return series.rolling(window=period).mean()
+    """Simple Moving Average.  First period−1 values are NaN."""
+    return series.rolling(window=period, min_periods=period).mean()
 
 
 def detect_crossover(a: pd.Series, b: pd.Series) -> str | None:
     """
-    Detect crossover between series a and b at the last two candles.
-    Returns 'bullish' if a crossed above b, 'bearish' if a crossed below b,
-    else None.
+    Detect a crossover between series `a` and `b` using the last two bars.
+
+    Returns
+    -------
+    'bullish'  — a was below b on bar[-2], now above b on bar[-1]
+    'bearish'  — a was above b on bar[-2], now below b on bar[-1]
+    None       — no crossover, or insufficient / NaN data
     """
-    if len(a) < 2 or a.isna().iloc[-2:].any() or b.isna().iloc[-2:].any():
+    if len(a) < 2 or len(b) < 2:
+        return None
+    if a.iloc[-2:].isna().any() or b.iloc[-2:].isna().any():
         return None
 
-    prev_above = a.iloc[-2] > b.iloc[-2]
-    curr_above = a.iloc[-1] > b.iloc[-1]
+    prev_above = float(a.iloc[-2]) > float(b.iloc[-2])
+    curr_above = float(a.iloc[-1]) > float(b.iloc[-1])
 
     if not prev_above and curr_above:
         return "bullish"
@@ -148,83 +183,108 @@ def detect_crossover(a: pd.Series, b: pd.Series) -> str | None:
 
 
 # ─── SIGNAL FORMATTING ─────────────────────────────────────────────────────────
-ARROW = {"bullish": "🟢 ▲ BULLISH", "bearish": "🔴 ▼ BEARISH"}
+_DIRECTION = {"bullish": "🟢 ▲ BULLISH CROSS", "bearish": "🔴 ▼ BEARISH CROSS"}
 
 def format_signal(
-    timeframe: str,
+    timeframe:   str,
     signal_type: str,
-    crossover: str,
-    rsi_val: float,
-    ma_val: float,
+    crossover:   str,
+    rsi_val:     float,
+    ma_val:      float,
     candle_time: datetime,
-    price: float,
+    price:       float,
 ) -> str:
-    direction = ARROW[crossover]
-    ts = candle_time.strftime("%Y-%m-%d %H:%M UTC")
-
+    direction = _DIRECTION[crossover]
+    ts        = candle_time.strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"<b>⚡ RSI CROSSOVER SIGNAL</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 <b>Symbol:</b> {SYMBOL}\n"
-        f"⏱ <b>Timeframe:</b> {timeframe}\n"
-        f"📊 <b>Signal:</b> {signal_type}\n"
-        f"🔀 <b>Direction:</b> {direction}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>RSI(28):</b> {rsi_val:.2f}\n"
-        f"📉 <b>MA Value:</b> {ma_val:.2f}\n"
-        f"💵 <b>Price:</b> ${price:.4f}\n"
-        f"🕐 <b>Candle Close:</b> {ts}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 <b>Symbol    :</b> {SYMBOL}\n"
+        f"⏱ <b>Timeframe :</b> {timeframe}\n"
+        f"📊 <b>Signal    :</b> {signal_type}\n"
+        f"🔀 <b>Direction :</b> {direction}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>RSI({RSI_PERIOD})   :</b> {rsi_val:.2f}\n"
+        f"📉 <b>MA value  :</b> {ma_val:.2f}\n"
+        f"💵 <b>Price     :</b> ${price:.4f}\n"
+        f"🕐 <b>Closed at :</b> {ts}\n"
     )
 
 
-# ─── PER-TIMEFRAME STATE ───────────────────────────────────────────────────────
+# ─── PER-TIMEFRAME TRACKER ─────────────────────────────────────────────────────
 class TimeframeTracker:
     """
-    Tracks crossover state for a single timeframe.
-    Stores last seen candle close time to avoid duplicate signals.
-    """
-    def __init__(self, interval: str, poll_seconds: int):
-        self.interval      = interval
-        self.poll_seconds  = poll_seconds
-        self.last_candle_time: datetime | None = None
-        self.last_ema_cross: str | None = None   # last known ema crossover state
-        self.last_sma_cross: str | None = None   # last known sma crossover state
+    Manages state for one timeframe (3m or 5m).
 
+    On every call to check_and_signal():
+      1. Fetches the latest CANDLE_LIMIT closed candles.
+      2. Verifies we have enough data for stable indicator warm-up.
+      3. Computes RSI, EMA(RSI), SMA(RSI).
+      4. Detects crossovers on the freshly closed bar.
+      5. Guards against duplicate signals (same direction on consecutive bars).
+      6. Returns formatted Telegram messages for any new crossovers.
+    """
+
+    def __init__(self, interval: str):
+        self.interval         = interval
+        self.last_candle_time: datetime | None = None
+        # Track last fired direction per signal to suppress duplicates
+        self.last_ema_cross:  str | None = None
+        self.last_sma_cross:  str | None = None
+
+    # ── public ─────────────────────────────────────────────────────────────────
     def check_and_signal(self) -> list[str]:
         """
-        Fetch latest closed candles, compute indicators, detect crossovers.
-        Returns list of Telegram messages to send (may be empty).
+        Run one check cycle.  Returns a (possibly empty) list of Telegram messages.
         """
         df = fetch_klines(SYMBOL, self.interval)
-        if df.empty or len(df) < SMA_PERIOD + RSI_PERIOD:
-            log.warning("[%s] Not enough candles returned.", self.interval)
+
+        # ── guard: empty response ───────────────────────────────────────────
+        if df.empty:
+            log.warning("[%s] Empty response from Binance — skipping.", self.interval)
+            return []
+
+        # ── guard: insufficient candles for warm-up ─────────────────────────
+        if len(df) < MIN_CANDLES_REQUIRED:
+            log.warning(
+                "[%s] Only %d candles returned (need ≥ %d) — skipping.",
+                self.interval, len(df), MIN_CANDLES_REQUIRED,
+            )
             return []
 
         last_close_time = df["close_time"].iloc[-1]
 
-        # Skip if we've already processed this candle
-        if self.last_candle_time is not None and last_close_time <= self.last_candle_time:
-            log.debug("[%s] No new closed candle yet.", self.interval)
+        # ── guard: already processed this candle ────────────────────────────
+        if (self.last_candle_time is not None
+                and last_close_time <= self.last_candle_time):
+            log.debug("[%s] Candle %s already processed — skipping.",
+                      self.interval, last_close_time)
             return []
 
         self.last_candle_time = last_close_time
 
-        close  = df["close"]
-        rsi    = compute_rsi(close)
-        ema13  = compute_ema(rsi, EMA_PERIOD)
-        sma50  = compute_sma(rsi, SMA_PERIOD)
+        # ── compute indicators ──────────────────────────────────────────────
+        close = df["close"]
+        rsi   = compute_rsi(close)
+        ema13 = compute_ema(rsi, EMA_PERIOD)
+        sma50 = compute_sma(rsi, SMA_PERIOD)
 
-        latest_rsi   = rsi.iloc[-1]
-        latest_ema   = ema13.iloc[-1]
-        latest_sma   = sma50.iloc[-1]
-        latest_price = close.iloc[-1]
+        latest_rsi   = float(rsi.iloc[-1])
+        latest_ema   = float(ema13.iloc[-1])
+        latest_sma   = float(sma50.iloc[-1])
+        latest_price = float(close.iloc[-1])
         candle_ts    = last_close_time.to_pydatetime()
 
-        messages = []
+        # ── guard: NaN in final values (should not happen with CANDLE_LIMIT=300)
+        if any(np.isnan(v) for v in (latest_rsi, latest_ema, latest_sma)):
+            log.warning("[%s] NaN in indicator values — skipping candle.", self.interval)
+            return []
 
-        # ── Signal 1: RSI(28) × EMA(13) ────────────────────────────────────
+        messages: list[str] = []
+
+        # ── Signal 1 : RSI(28) × EMA(13) ───────────────────────────────────
         ema_cross = detect_crossover(rsi, ema13)
-        if ema_cross and ema_cross != self.last_ema_cross:
+        if ema_cross is not None and ema_cross != self.last_ema_cross:
             self.last_ema_cross = ema_cross
             msg = format_signal(
                 timeframe   = self.interval,
@@ -236,12 +296,12 @@ class TimeframeTracker:
                 price       = latest_price,
             )
             messages.append(msg)
-            log.info("[%s] EMA crossover: %s | RSI=%.2f EMA=%.2f",
-                     self.interval, ema_cross, latest_rsi, latest_ema)
+            log.info("[%s] EMA CROSS %s | RSI=%.2f  EMA13=%.2f  price=%.4f",
+                     self.interval, ema_cross.upper(), latest_rsi, latest_ema, latest_price)
 
-        # ── Signal 2: RSI(28) × SMA(50) ────────────────────────────────────
+        # ── Signal 2 : RSI(28) × SMA(50) ───────────────────────────────────
         sma_cross = detect_crossover(rsi, sma50)
-        if sma_cross and sma_cross != self.last_sma_cross:
+        if sma_cross is not None and sma_cross != self.last_sma_cross:
             self.last_sma_cross = sma_cross
             msg = format_signal(
                 timeframe   = self.interval,
@@ -253,15 +313,16 @@ class TimeframeTracker:
                 price       = latest_price,
             )
             messages.append(msg)
-            log.info("[%s] SMA crossover: %s | RSI=%.2f SMA=%.2f",
-                     self.interval, sma_cross, latest_rsi, latest_sma)
+            log.info("[%s] SMA CROSS %s | RSI=%.2f  SMA50=%.2f  price=%.4f",
+                     self.interval, sma_cross.upper(), latest_rsi, latest_sma, latest_price)
 
+        # ── status log when no crossover ────────────────────────────────────
         if not messages:
             log.info(
-                "[%s] Candle closed @ %s | RSI=%.2f | EMA13=%.2f | SMA50=%.2f | No crossover",
+                "[%s] ✓ closed %s | RSI=%.2f | EMA13=%.2f | SMA50=%.2f | $%.4f | no cross",
                 self.interval,
                 candle_ts.strftime("%H:%M"),
-                latest_rsi, latest_ema, latest_sma,
+                latest_rsi, latest_ema, latest_sma, latest_price,
             )
 
         return messages
@@ -270,108 +331,131 @@ class TimeframeTracker:
 # ─── SCHEDULER ─────────────────────────────────────────────────────────────────
 def seconds_to_next_close(interval_minutes: int) -> float:
     """
-    Returns how many seconds until the next candle of this interval closes.
-    Adds a 2-second buffer so the candle is definitely closed on Binance.
+    Compute seconds until the next candle of this interval finishes.
+    Adds CANDLE_CLOSE_BUFFER_SECS so Binance has time to finalise the bar.
     """
     now_ts  = time.time()
     period  = interval_minutes * 60
     elapsed = now_ts % period
-    wait    = period - elapsed + 2          # +2s buffer
-    return wait
+    return period - elapsed + CANDLE_CLOSE_BUFFER_SECS
 
 
-def run_tracker(tracker: TimeframeTracker, interval_minutes: int):
+def run_tracker(tracker: TimeframeTracker, interval_minutes: int) -> None:
     """
-    Blocking loop that sleeps until each candle close, then checks for signals.
-    Designed to run in a separate thread.
+    Infinite loop: sleep until next candle close, then check for signals.
+    Runs in its own daemon thread.
     """
-    import threading
-    name = f"[{tracker.interval}]"
-    log.info("%s tracker started.", name)
+    tag = f"[{tracker.interval}]"
+    log.info("%s thread started (interval = %dm).", tag, interval_minutes)
 
     while True:
-        wait = seconds_to_next_close(interval_minutes)
-        next_check = datetime.now(timezone.utc).replace(microsecond=0)
-        log.info("%s Next candle close check in %.0fs  (~%s UTC)",
-                 name, wait, next_check)
+        wait        = seconds_to_next_close(interval_minutes)
+        wake_at_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        log.info("%s sleeping %.0f s until next close (≈%s UTC)",
+                 tag, wait, wake_at_utc)
         time.sleep(wait)
 
         try:
             messages = tracker.check_and_signal()
             for msg in messages:
                 send_telegram(msg)
-        except Exception as e:
-            log.error("%s Unhandled error: %s", name, e)
+        except Exception as exc:
+            log.error("%s unhandled error: %s", tag, exc, exc_info=True)
 
 
-# ─── STARTUP TEST ──────────────────────────────────────────────────────────────
-def startup_test():
-    """Send a startup ping and do a quick data sanity check."""
+# ─── STARTUP ───────────────────────────────────────────────────────────────────
+def startup_checks() -> None:
+    """
+    Verify connectivity, log warm-up stats, and fire a Telegram startup message.
+    """
     log.info("Running startup checks …")
 
-    # Test Binance connectivity
+    # 1. Binance ping
     try:
         r = requests.get(f"{BINANCE_BASE}/api/v3/ping", timeout=5)
         r.raise_for_status()
         log.info("Binance API ✅ reachable")
-    except Exception as e:
-        log.error("Binance API ❌ unreachable: %s", e)
+    except Exception as exc:
+        log.error("Binance API ❌ unreachable: %s", exc)
 
-    # Test Telegram
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    startup_msg = (
-        f"<b>🤖 RSI Crossover Bot Started</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Symbol: <b>{SYMBOL}</b>\n"
-        f"⏱ Timeframes: <b>3m, 5m</b>\n"
-        f"📊 RSI Period: <b>{RSI_PERIOD}</b>\n"
-        f"📐 Signals: <b>RSI×EMA({EMA_PERIOD})</b> &amp; <b>RSI×SMA({SMA_PERIOD})</b>\n"
-        f"🕐 Started: <b>{now_str}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Monitoring for crossovers on candle close …"
+    # 2. Warm-up summary
+    log.info(
+        "Warm-up: RSI needs %d bars | EMA needs %d | SMA needs %d | "
+        "CANDLE_LIMIT=%d → %d stable bars after warm-up",
+        RSI_PERIOD,
+        RSI_PERIOD + EMA_PERIOD,
+        RSI_PERIOD + SMA_PERIOD,
+        CANDLE_LIMIT,
+        CANDLE_LIMIT - (RSI_PERIOD + SMA_PERIOD + 2),
     )
-    send_telegram(startup_msg)
 
-    # Quick indicator sanity check on 3m data
-    df = fetch_klines(SYMBOL, "3m", limit=100)
-    if not df.empty:
+    # 3. Live indicator sanity check on 3m
+    df = fetch_klines(SYMBOL, "3m", limit=CANDLE_LIMIT)
+    if not df.empty and len(df) >= MIN_CANDLES_REQUIRED:
         rsi   = compute_rsi(df["close"])
         ema13 = compute_ema(rsi, EMA_PERIOD)
         sma50 = compute_sma(rsi, SMA_PERIOD)
+        rsi_nan  = rsi.isna().sum()
+        ema_nan  = ema13.isna().sum()
+        sma_nan  = sma50.isna().sum()
         log.info(
-            "Sanity check 3m | RSI=%.2f | EMA13=%.2f | SMA50=%.2f | Price=%.4f",
-            rsi.iloc[-1], ema13.iloc[-1], sma50.iloc[-1], df["close"].iloc[-1],
+            "3m live check | candles=%d | RSI NaN=%d | EMA NaN=%d | SMA NaN=%d",
+            len(df), rsi_nan, ema_nan, sma_nan,
+        )
+        log.info(
+            "3m live values | RSI=%.2f | EMA13=%.2f | SMA50=%.2f | price=%.4f",
+            float(rsi.iloc[-1]), float(ema13.iloc[-1]),
+            float(sma50.iloc[-1]), float(df["close"].iloc[-1]),
         )
     else:
-        log.warning("Could not fetch 3m data for sanity check.")
+        log.warning("Could not complete 3m sanity check (data: %d rows).", len(df))
+
+    # 4. Telegram startup message
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    send_telegram(
+        f"<b>🤖 RSI Crossover Bot — ONLINE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 <b>Symbol     :</b> {SYMBOL}\n"
+        f"⏱ <b>Timeframes :</b> 3m &amp; 5m\n"
+        f"📊 <b>RSI period :</b> {RSI_PERIOD}\n"
+        f"📐 <b>Signals    :</b> RSI×EMA({EMA_PERIOD})  &amp;  RSI×SMA({SMA_PERIOD})\n"
+        f"📦 <b>Candles    :</b> {CANDLE_LIMIT} fetched → "
+        f"{CANDLE_LIMIT - (RSI_PERIOD + SMA_PERIOD + 2)} stable bars\n"
+        f"🕐 <b>Started    :</b> {now_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Watching for crossovers on candle close …"
+    )
 
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
-def main():
+def main() -> None:
     import threading
 
-    log.info("=" * 55)
+    log.info("=" * 60)
     log.info("  SOLUSDT RSI Crossover Bot")
-    log.info("  Signals: RSI(28)×EMA(13) and RSI(28)×SMA(50)")
-    log.info("  Timeframes: 3m and 5m  |  On candle close")
-    log.info("=" * 55)
+    log.info("  Signals : RSI(%d)×EMA(%d)  and  RSI(%d)×SMA(%d)",
+             RSI_PERIOD, EMA_PERIOD, RSI_PERIOD, SMA_PERIOD)
+    log.info("  TFs     : 3m, 5m  |  trigger: candle close + %ds buffer",
+             CANDLE_CLOSE_BUFFER_SECS)
+    log.info("  Candles : %d fetched  |  min required: %d  |  stable: %d",
+             CANDLE_LIMIT, MIN_CANDLES_REQUIRED,
+             CANDLE_LIMIT - MIN_CANDLES_REQUIRED)
+    log.info("=" * 60)
 
-    startup_test()
+    startup_checks()
 
-    threads = []
-    for interval_str, poll_secs in TIMEFRAMES:
-        interval_minutes = int(interval_str.replace("m", ""))
-        tracker = TimeframeTracker(interval_str, poll_secs)
-
+    threads: list[threading.Thread] = []
+    for interval_str, interval_min in TIMEFRAMES:
+        tracker = TimeframeTracker(interval_str)
         t = threading.Thread(
             target=run_tracker,
-            args=(tracker, interval_minutes),
+            args=(tracker, interval_min),
             name=f"tracker-{interval_str}",
             daemon=True,
         )
         t.start()
         threads.append(t)
-        log.info("Thread started for %s", interval_str)
+        log.info("Thread started → %s", interval_str)
 
     log.info("Bot running. Press Ctrl+C to stop.")
     try:
