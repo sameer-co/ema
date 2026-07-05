@@ -1,372 +1,386 @@
 #!/usr/bin/env python3
 """
-SOL 9EMA / 9SMA Crossover Alert Bot
-=====================================
+SOLUSDT RSI Crossover Signal Bot
+=================================
+Tracks RSI(28) crossovers on 3m and 5m timeframes:
+  - Signal 1: RSI(28) × EMA(13) crossover
+  - Signal 2: RSI(28) × SMA(50) crossover
 
-Watches SOLUSDT on Binance across 3m, 5m and 15m timeframes.
-On each timeframe, independently checks for a 9 EMA / 9 SMA crossover:
-
-    BUY  signal -> 9 EMA crosses ABOVE the 9 SMA  (bullish crossover)
-    SELL signal -> 9 EMA crosses BELOW the 9 SMA  (bearish crossover)
-
-Each Telegram alert also includes, purely as extra context (it does NOT
-gate the signal):
-    - RSI(28) value
-    - 13 EMA value and whether price/9EMA is currently above or below it
-
-Dependencies are auto-installed on first run (requests).
-
-------------------------------------------------------------------
-SECURITY NOTE (read this):
-Your Telegram bot token was shared in plain text in chat. Treat it as
-compromised. Go to @BotFather on Telegram -> /mybots -> select your bot
--> API Token -> Revoke/Regenerate, then put the NEW token below (or,
-better, set it as an environment variable instead of hardcoding it,
-see CONFIG section).
-------------------------------------------------------------------
-
-Deployment note (Railway):
-This script runs as an infinite loop with a sleep, which is exactly the
-shape Railway wants for a long-running worker process. Just set this as
-your Start Command (e.g. `python sol_ema_sma_bot.py`) in a Railway
-service, and optionally move the token/chat id into Railway's
-Variables tab instead of hardcoding them (recommended).
+Polls Binance on candle close and sends Telegram alerts.
 """
 
-import sys
-import subprocess
-import importlib
-
-
-# ---------------------------------------------------------------------------
-# 0. AUTO-INSTALL DEPENDENCIES
-# ---------------------------------------------------------------------------
-REQUIRED_PACKAGES = ["requests"]
-
-
-def ensure_dependencies():
-    for pkg in REQUIRED_PACKAGES:
-        try:
-            importlib.import_module(pkg)
-        except ImportError:
-            print(f"[setup] '{pkg}' not found, installing...")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet", pkg]
-            )
-            print(f"[setup] '{pkg}' installed.")
-
-
-ensure_dependencies()
-
-import os
 import time
 import logging
-from collections import deque
+import requests
+import pandas as pd
+import numpy as np
 from datetime import datetime, timezone
 
-import requests
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg---"
+TELEGRAM_CHAT_ID = "1950462171"
 
+SYMBOL     = "SOLUSDT"
+BINANCE_BASE = "https://api.binance.com"
 
-# ---------------------------------------------------------------------------
-# 1. CONFIG
-# ---------------------------------------------------------------------------
-# Prefer environment variables (Railway -> Variables tab). Falls back to the
-# hardcoded values below ONLY if the env var isn't set, so this still runs
-# standalone on your own machine.
+# RSI & moving-average settings
+RSI_PERIOD = 28
+EMA_PERIOD = 13
+SMA_PERIOD = 50
 
-TELEGRAM_TOKEN = os.environ.get(
-    "TELEGRAM_TOKEN", "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg"
-)
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1950462171")
+# Candles to fetch (must be > SMA_PERIOD + RSI_PERIOD for warm-up)
+CANDLE_LIMIT = 200
 
-SYMBOL = os.environ.get("SYMBOL", "SOLUSDT")
-TIMEFRAMES = ["3m", "5m", "15m"]   # Binance interval strings
+# Timeframes to monitor: (interval_string, poll_interval_seconds)
+TIMEFRAMES = [
+    ("3m", 3 * 60),
+    ("5m", 5 * 60),
+]
 
-EMA_FAST_PERIOD = 9      # 9 EMA
-SMA_PERIOD = 9           # 9 SMA
-EMA_TREND_PERIOD = 13    # 13 EMA (informational)
-RSI_PERIOD = 28          # RSI(28) (informational)
-
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))  # how often to check
-KLINES_LIMIT = 200        # candles to fetch (plenty for warm-up of all indicators)
-
-BINANCE_BASE_URL = "https://api.binance.com"
-KLINES_ENDPOINT = "/api/v3/klines"
-
-# ---------------------------------------------------------------------------
-# 2. LOGGING
-# ---------------------------------------------------------------------------
+# ─── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("sol_bot")
+log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# 3. INDICATOR MATH (pure python, no extra deps needed)
-# ---------------------------------------------------------------------------
-def sma(values, period):
-    """Simple Moving Average series. Returns list aligned to `values`
-    (first `period-1` entries are None)."""
-    out = [None] * len(values)
-    if len(values) < period:
-        return out
-    window_sum = sum(values[:period])
-    out[period - 1] = window_sum / period
-    for i in range(period, len(values)):
-        window_sum += values[i] - values[i - period]
-        out[i] = window_sum / period
-    return out
-
-
-def ema(values, period):
-    """Exponential Moving Average series. Seeded with SMA of the first
-    `period` values, standard convention. Returns list aligned to
-    `values` (first `period-1` entries are None)."""
-    out = [None] * len(values)
-    if len(values) < period:
-        return out
-    k = 2 / (period + 1)
-    seed = sum(values[:period]) / period
-    out[period - 1] = seed
-    prev = seed
-    for i in range(period, len(values)):
-        prev = values[i] * k + prev * (1 - k)
-        out[i] = prev
-    return out
-
-
-def rsi(values, period):
-    """Wilder's RSI. Returns list aligned to `values`."""
-    out = [None] * len(values)
-    if len(values) < period + 1:
-        return out
-
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    def calc_rsi(avg_gain, avg_loss):
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-
-    out[period] = calc_rsi(avg_gain, avg_loss)
-
-    for i in range(period + 1, len(values)):
-        change = values[i] - values[i - 1]
-        gain = max(change, 0)
-        loss = max(-change, 0)
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        out[i] = calc_rsi(avg_gain, avg_loss)
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 4. DATA FETCH
-# ---------------------------------------------------------------------------
-def fetch_klines(symbol, interval, limit=KLINES_LIMIT):
-    """Fetch candles from Binance public REST API. Returns list of dicts
-    with at least 'close_time' and 'close' (float), oldest -> newest.
-    The most recent candle returned by Binance is usually still FORMING
-    (not closed yet) -- we keep that in mind in the signal logic."""
-    url = BINANCE_BASE_URL + KLINES_ENDPOINT
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    raw = resp.json()
-
-    candles = []
-    for k in raw:
-        candles.append(
-            {
-                "open_time": k[0],
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-                "close_time": k[6],
-                "is_closed": True,  # corrected below for the last candle
-            }
-        )
-    if candles:
-        candles[-1]["is_closed"] = False  # last candle is still forming
-    return candles
-
-
-# ---------------------------------------------------------------------------
-# 5. TELEGRAM
-# ---------------------------------------------------------------------------
-def send_telegram_message(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram token/chat id not set, skipping send.")
-        return
+# ─── TELEGRAM ──────────────────────────────────────────────────────────────────
+def send_telegram(message: str) -> bool:
+    """Send a message via Telegram Bot API."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
+        "text": message,
         "parse_mode": "HTML",
     }
     try:
-        resp = requests.post(url, data=payload, timeout=10)
-        if resp.status_code != 200:
-            log.error(f"Telegram send failed: {resp.status_code} {resp.text}")
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            log.info("Telegram ✅ sent: %s", message[:80])
+            return True
+        else:
+            log.error("Telegram ❌ error %s: %s", resp.status_code, resp.text)
+            return False
+    except Exception as e:
+        log.error("Telegram exception: %s", e)
+        return False
+
+
+# ─── BINANCE DATA ──────────────────────────────────────────────────────────────
+def fetch_klines(symbol: str, interval: str, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
+    """
+    Fetch OHLCV klines from Binance public REST API.
+    Returns DataFrame with columns: open_time, open, high, low, close, volume, close_time.
+    Only closed candles are included (last candle excluded as it may be live).
+    """
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit + 1}
+
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
     except requests.RequestException as e:
-        log.error(f"Telegram send exception: {e}")
+        log.error("Binance fetch error: %s", e)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(raw, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+
+    # Keep only closed candles (drop the last live candle)
+    df = df.iloc[:-1].copy()
+
+    df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df["close"]      = df["close"].astype(float)
+
+    return df[["open_time", "close_time", "open", "high", "low", "close", "volume"]]
 
 
-# ---------------------------------------------------------------------------
-# 6. SIGNAL ENGINE (per timeframe, tracks last crossover state to avoid
-#    spamming the same signal repeatedly)
-# ---------------------------------------------------------------------------
-class TimeframeTracker:
-    """Holds last-known crossover relationship (ema9 vs sma9) for one
-    timeframe so we only alert on the actual cross, not every poll."""
+# ─── INDICATORS ────────────────────────────────────────────────────────────────
+def compute_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    """Wilder's smoothed RSI."""
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
 
-    def __init__(self, symbol, interval):
-        self.symbol = symbol
-        self.interval = interval
-        self.last_relationship = None  # "above" | "below" | None
-        self.last_closed_open_time = None  # avoid reprocessing same candle
+    # Wilder smoothing (equivalent to EMA with alpha = 1/period)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
-    def check(self):
-        try:
-            candles = fetch_klines(self.symbol, self.interval)
-        except Exception as e:
-            log.error(f"[{self.interval}] fetch error: {e}")
-            return
-
-        # Only evaluate on CLOSED candles to avoid false signals from a
-        # half-formed candle repainting the indicators every few seconds.
-        closed = [c for c in candles if c["is_closed"]]
-        if len(closed) < max(EMA_TREND_PERIOD, RSI_PERIOD + 1, SMA_PERIOD) + 2:
-            log.info(f"[{self.interval}] not enough closed candles yet, skipping.")
-            return
-
-        latest_closed = closed[-1]
-        if self.last_closed_open_time == latest_closed["open_time"]:
-            return  # already processed this candle, nothing new
-        self.last_closed_open_time = latest_closed["open_time"]
-
-        closes = [c["close"] for c in closed]
-
-        ema9_series = ema(closes, EMA_FAST_PERIOD)
-        sma9_series = sma(closes, SMA_PERIOD)
-        ema13_series = ema(closes, EMA_TREND_PERIOD)
-        rsi28_series = rsi(closes, RSI_PERIOD)
-
-        ema9_now = ema9_series[-1]
-        sma9_now = sma9_series[-1]
-        ema13_now = ema13_series[-1]
-        rsi28_now = rsi28_series[-1]
-
-        if ema9_now is None or sma9_now is None:
-            return
-
-        current_relationship = "above" if ema9_now > sma9_now else "below"
-
-        # First time we have a reading: just record it, don't fire an alert
-        # (we don't know what happened "before" we started watching).
-        if self.last_relationship is None:
-            self.last_relationship = current_relationship
-            log.info(
-                f"[{self.interval}] baseline set: 9EMA is {current_relationship} 9SMA "
-                f"(ema9={ema9_now:.4f}, sma9={sma9_now:.4f})"
-            )
-            return
-
-        crossed_up = self.last_relationship == "below" and current_relationship == "above"
-        crossed_down = self.last_relationship == "above" and current_relationship == "below"
-
-        if crossed_up or crossed_down:
-            self.fire_alert(
-                direction="BUY" if crossed_up else "SELL",
-                price=latest_closed["close"],
-                ema9=ema9_now,
-                sma9=sma9_now,
-                ema13=ema13_now,
-                rsi28=rsi28_now,
-                candle_time=latest_closed["close_time"],
-            )
-
-        self.last_relationship = current_relationship
-
-    def fire_alert(self, direction, price, ema9, sma9, ema13, rsi28, candle_time):
-        ts = datetime.fromtimestamp(candle_time / 1000, tz=timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-
-        emoji = "🟢" if direction == "BUY" else "🔴"
-        ema13_status = "N/A"
-        if ema13 is not None:
-            ema13_status = "Price above 13EMA (uptrend bias)" if price > ema13 else "Price below 13EMA (downtrend bias)"
-
-        rsi_status = "N/A"
-        if rsi28 is not None:
-            if rsi28 >= 70:
-                rsi_status = f"{rsi28:.2f} (overbought)"
-            elif rsi28 <= 30:
-                rsi_status = f"{rsi28:.2f} (oversold)"
-            else:
-                rsi_status = f"{rsi28:.2f} (neutral)"
-
-        message = (
-            f"{emoji} <b>{direction} SIGNAL</b> — {SYMBOL} [{self.interval}]\n"
-            f"9 EMA crossed {'ABOVE' if direction == 'BUY' else 'BELOW'} 9 SMA\n\n"
-            f"Price: <b>{price:.4f}</b>\n"
-            f"9 EMA: {ema9:.4f}\n"
-            f"9 SMA: {sma9:.4f}\n"
-            f"13 EMA: {ema13:.4f} -> {ema13_status}\n"
-            f"RSI(28): {rsi_status}\n\n"
-            f"Candle close: {ts}"
-        )
-
-        log.info(f"ALERT [{self.interval}] {direction} @ {price}")
-        send_telegram_message(message)
+    rs  = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 
-# ---------------------------------------------------------------------------
-# 7. MAIN LOOP
-# ---------------------------------------------------------------------------
-def main():
-    log.info(f"Starting SOL 9EMA/9SMA crossover bot for {SYMBOL} on {TIMEFRAMES}")
-    log.info(f"Poll interval: {POLL_SECONDS}s | RSI period: {RSI_PERIOD} | 13EMA trend filter shown as info only")
+def compute_ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential Moving Average."""
+    return series.ewm(span=period, adjust=False).mean()
 
-    trackers = [TimeframeTracker(SYMBOL, tf) for tf in TIMEFRAMES]
 
-    send_telegram_message(
-        f"✅ SOL crossover bot started.\nSymbol: {SYMBOL}\nTimeframes: {', '.join(TIMEFRAMES)}\n"
-        f"Watching for 9EMA/9SMA crossovers."
+def compute_sma(series: pd.Series, period: int) -> pd.Series:
+    """Simple Moving Average."""
+    return series.rolling(window=period).mean()
+
+
+def detect_crossover(a: pd.Series, b: pd.Series) -> str | None:
+    """
+    Detect crossover between series a and b at the last two candles.
+    Returns 'bullish' if a crossed above b, 'bearish' if a crossed below b,
+    else None.
+    """
+    if len(a) < 2 or a.isna().iloc[-2:].any() or b.isna().iloc[-2:].any():
+        return None
+
+    prev_above = a.iloc[-2] > b.iloc[-2]
+    curr_above = a.iloc[-1] > b.iloc[-1]
+
+    if not prev_above and curr_above:
+        return "bullish"
+    if prev_above and not curr_above:
+        return "bearish"
+    return None
+
+
+# ─── SIGNAL FORMATTING ─────────────────────────────────────────────────────────
+ARROW = {"bullish": "🟢 ▲ BULLISH", "bearish": "🔴 ▼ BEARISH"}
+
+def format_signal(
+    timeframe: str,
+    signal_type: str,
+    crossover: str,
+    rsi_val: float,
+    ma_val: float,
+    candle_time: datetime,
+    price: float,
+) -> str:
+    direction = ARROW[crossover]
+    ts = candle_time.strftime("%Y-%m-%d %H:%M UTC")
+
+    return (
+        f"<b>⚡ RSI CROSSOVER SIGNAL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 <b>Symbol:</b> {SYMBOL}\n"
+        f"⏱ <b>Timeframe:</b> {timeframe}\n"
+        f"📊 <b>Signal:</b> {signal_type}\n"
+        f"🔀 <b>Direction:</b> {direction}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>RSI(28):</b> {rsi_val:.2f}\n"
+        f"📉 <b>MA Value:</b> {ma_val:.2f}\n"
+        f"💵 <b>Price:</b> ${price:.4f}\n"
+        f"🕐 <b>Candle Close:</b> {ts}\n"
     )
 
+
+# ─── PER-TIMEFRAME STATE ───────────────────────────────────────────────────────
+class TimeframeTracker:
+    """
+    Tracks crossover state for a single timeframe.
+    Stores last seen candle close time to avoid duplicate signals.
+    """
+    def __init__(self, interval: str, poll_seconds: int):
+        self.interval      = interval
+        self.poll_seconds  = poll_seconds
+        self.last_candle_time: datetime | None = None
+        self.last_ema_cross: str | None = None   # last known ema crossover state
+        self.last_sma_cross: str | None = None   # last known sma crossover state
+
+    def check_and_signal(self) -> list[str]:
+        """
+        Fetch latest closed candles, compute indicators, detect crossovers.
+        Returns list of Telegram messages to send (may be empty).
+        """
+        df = fetch_klines(SYMBOL, self.interval)
+        if df.empty or len(df) < SMA_PERIOD + RSI_PERIOD:
+            log.warning("[%s] Not enough candles returned.", self.interval)
+            return []
+
+        last_close_time = df["close_time"].iloc[-1]
+
+        # Skip if we've already processed this candle
+        if self.last_candle_time is not None and last_close_time <= self.last_candle_time:
+            log.debug("[%s] No new closed candle yet.", self.interval)
+            return []
+
+        self.last_candle_time = last_close_time
+
+        close  = df["close"]
+        rsi    = compute_rsi(close)
+        ema13  = compute_ema(rsi, EMA_PERIOD)
+        sma50  = compute_sma(rsi, SMA_PERIOD)
+
+        latest_rsi   = rsi.iloc[-1]
+        latest_ema   = ema13.iloc[-1]
+        latest_sma   = sma50.iloc[-1]
+        latest_price = close.iloc[-1]
+        candle_ts    = last_close_time.to_pydatetime()
+
+        messages = []
+
+        # ── Signal 1: RSI(28) × EMA(13) ────────────────────────────────────
+        ema_cross = detect_crossover(rsi, ema13)
+        if ema_cross and ema_cross != self.last_ema_cross:
+            self.last_ema_cross = ema_cross
+            msg = format_signal(
+                timeframe   = self.interval,
+                signal_type = f"RSI({RSI_PERIOD}) × EMA({EMA_PERIOD})",
+                crossover   = ema_cross,
+                rsi_val     = latest_rsi,
+                ma_val      = latest_ema,
+                candle_time = candle_ts,
+                price       = latest_price,
+            )
+            messages.append(msg)
+            log.info("[%s] EMA crossover: %s | RSI=%.2f EMA=%.2f",
+                     self.interval, ema_cross, latest_rsi, latest_ema)
+
+        # ── Signal 2: RSI(28) × SMA(50) ────────────────────────────────────
+        sma_cross = detect_crossover(rsi, sma50)
+        if sma_cross and sma_cross != self.last_sma_cross:
+            self.last_sma_cross = sma_cross
+            msg = format_signal(
+                timeframe   = self.interval,
+                signal_type = f"RSI({RSI_PERIOD}) × SMA({SMA_PERIOD})",
+                crossover   = sma_cross,
+                rsi_val     = latest_rsi,
+                ma_val      = latest_sma,
+                candle_time = candle_ts,
+                price       = latest_price,
+            )
+            messages.append(msg)
+            log.info("[%s] SMA crossover: %s | RSI=%.2f SMA=%.2f",
+                     self.interval, sma_cross, latest_rsi, latest_sma)
+
+        if not messages:
+            log.info(
+                "[%s] Candle closed @ %s | RSI=%.2f | EMA13=%.2f | SMA50=%.2f | No crossover",
+                self.interval,
+                candle_ts.strftime("%H:%M"),
+                latest_rsi, latest_ema, latest_sma,
+            )
+
+        return messages
+
+
+# ─── SCHEDULER ─────────────────────────────────────────────────────────────────
+def seconds_to_next_close(interval_minutes: int) -> float:
+    """
+    Returns how many seconds until the next candle of this interval closes.
+    Adds a 2-second buffer so the candle is definitely closed on Binance.
+    """
+    now_ts  = time.time()
+    period  = interval_minutes * 60
+    elapsed = now_ts % period
+    wait    = period - elapsed + 2          # +2s buffer
+    return wait
+
+
+def run_tracker(tracker: TimeframeTracker, interval_minutes: int):
+    """
+    Blocking loop that sleeps until each candle close, then checks for signals.
+    Designed to run in a separate thread.
+    """
+    import threading
+    name = f"[{tracker.interval}]"
+    log.info("%s tracker started.", name)
+
     while True:
-        for tracker in trackers:
-            tracker.check()
-        time.sleep(POLL_SECONDS)
+        wait = seconds_to_next_close(interval_minutes)
+        next_check = datetime.now(timezone.utc).replace(microsecond=0)
+        log.info("%s Next candle close check in %.0fs  (~%s UTC)",
+                 name, wait, next_check)
+        time.sleep(wait)
+
+        try:
+            messages = tracker.check_and_signal()
+            for msg in messages:
+                send_telegram(msg)
+        except Exception as e:
+            log.error("%s Unhandled error: %s", name, e)
+
+
+# ─── STARTUP TEST ──────────────────────────────────────────────────────────────
+def startup_test():
+    """Send a startup ping and do a quick data sanity check."""
+    log.info("Running startup checks …")
+
+    # Test Binance connectivity
+    try:
+        r = requests.get(f"{BINANCE_BASE}/api/v3/ping", timeout=5)
+        r.raise_for_status()
+        log.info("Binance API ✅ reachable")
+    except Exception as e:
+        log.error("Binance API ❌ unreachable: %s", e)
+
+    # Test Telegram
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    startup_msg = (
+        f"<b>🤖 RSI Crossover Bot Started</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 Symbol: <b>{SYMBOL}</b>\n"
+        f"⏱ Timeframes: <b>3m, 5m</b>\n"
+        f"📊 RSI Period: <b>{RSI_PERIOD}</b>\n"
+        f"📐 Signals: <b>RSI×EMA({EMA_PERIOD})</b> &amp; <b>RSI×SMA({SMA_PERIOD})</b>\n"
+        f"🕐 Started: <b>{now_str}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Monitoring for crossovers on candle close …"
+    )
+    send_telegram(startup_msg)
+
+    # Quick indicator sanity check on 3m data
+    df = fetch_klines(SYMBOL, "3m", limit=100)
+    if not df.empty:
+        rsi   = compute_rsi(df["close"])
+        ema13 = compute_ema(rsi, EMA_PERIOD)
+        sma50 = compute_sma(rsi, SMA_PERIOD)
+        log.info(
+            "Sanity check 3m | RSI=%.2f | EMA13=%.2f | SMA50=%.2f | Price=%.4f",
+            rsi.iloc[-1], ema13.iloc[-1], sma50.iloc[-1], df["close"].iloc[-1],
+        )
+    else:
+        log.warning("Could not fetch 3m data for sanity check.")
+
+
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    import threading
+
+    log.info("=" * 55)
+    log.info("  SOLUSDT RSI Crossover Bot")
+    log.info("  Signals: RSI(28)×EMA(13) and RSI(28)×SMA(50)")
+    log.info("  Timeframes: 3m and 5m  |  On candle close")
+    log.info("=" * 55)
+
+    startup_test()
+
+    threads = []
+    for interval_str, poll_secs in TIMEFRAMES:
+        interval_minutes = int(interval_str.replace("m", ""))
+        tracker = TimeframeTracker(interval_str, poll_secs)
+
+        t = threading.Thread(
+            target=run_tracker,
+            args=(tracker, interval_minutes),
+            name=f"tracker-{interval_str}",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info("Thread started for %s", interval_str)
+
+    log.info("Bot running. Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(30)
+    except KeyboardInterrupt:
+        log.info("Shutting down …")
+        send_telegram("🛑 <b>RSI Crossover Bot stopped.</b>")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        log.info("Stopped by user.")
-    except Exception as e:
-        log.exception(f"Fatal error: {e}")
-        # Try to notify via Telegram before dying, useful on Railway logs too
-        try:
-            send_telegram_message(f"⚠️ Bot crashed: {e}")
-        except Exception:
-            pass
-        raise
+    main()
